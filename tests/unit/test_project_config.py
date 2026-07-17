@@ -424,6 +424,45 @@ def test_validate_config_rejects_negative_river_buffer():
 
     with pytest.raises(ValueError, match="buffer_meters"):
         proj.validate_config()
+@pytest.mark.unit
+def test_validate_config_warns_on_renamed_pld_match_key(tmp_path, caplog):
+    """The old 'pld_match_max_distance_m' key was renamed to
+    'pld_match_min_overlap_pct' and its meaning changed from a distance in
+    metres to a minimum overlap percentage. Presence of the old key should
+    warn (not raise -- it's a migration nudge, not a blocking error) and
+    must NOT propagate the stale numeric value to the new key, since the
+    units are incompatible and silently reusing it could set an unintended
+    threshold."""
+    import logging
+    from HydroEO.project import Project
+
+    reservoirs_path = tmp_path / "res.gpkg"
+    reservoirs_path.write_text("placeholder")  # validate_config only checks existence
+
+    proj = Project.__new__(Project)
+    proj.config = {
+        "project": {
+            "main_dir": str(tmp_path),
+            "startdate": [2024, 1, 1],
+            "enddate": [2024, 2, 1],
+        },
+        "reservoirs": {"path": str(reservoirs_path), "id_key": "id"},
+        "swot": {
+            "download": True,
+            "process": True,
+            "pld_match_max_distance_m": 50.0,
+        },
+    }
+
+    with caplog.at_level(logging.WARNING):
+        result = proj.validate_config()  # should not raise
+
+    assert result is True
+    assert "pld_match_max_distance_m" in caplog.text
+    assert "pld_match_min_overlap_pct" in caplog.text
+    assert "50.0" in caplog.text
+    # the stale value must not have been silently written into the new key
+    assert "pld_match_min_overlap_pct" not in proj.config["swot"]
 
 
 @pytest.mark.unit

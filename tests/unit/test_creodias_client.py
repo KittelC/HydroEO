@@ -1,10 +1,99 @@
 """Unit tests for CREODIAS client/auth helpers (fully mocked)."""
 
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 import pytest
 
 from tests.conftest import TEST_END, TEST_START
+
+@pytest.mark.unit
+def test_download_with_retry_succeeds_after_transient_failures():
+    """_download_with_retry should retry through transient network
+    exceptions and succeed once the underlying download() call stops
+    failing, without needing the caller to handle anything."""
+    import requests
+    from HydroEO.downloaders import creodias
+
+    call_count = {"n": 0}
+
+    def fake_download(uid, token, outfile, show_progress=True):
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            raise requests.exceptions.ChunkedEncodingError("dropped connection")
+        # third attempt succeeds
+
+    with (
+        patch.object(creodias, "download", side_effect=fake_download),
+        patch.object(creodias.time, "sleep") as mock_sleep,
+    ):
+        creodias._download_with_retry("uid123", token="tok", outfile="/tmp/x.zip")
+
+    assert call_count["n"] == 3
+    assert mock_sleep.call_count == 2  # backoff between attempts 1->2 and 2->3
+
+
+@pytest.mark.unit
+def test_download_with_retry_raises_after_exhausting_attempts():
+    """A persistently-failing download should raise once retries are
+    exhausted, so the caller (download_list) can decide to skip it."""
+    import requests
+    from HydroEO.downloaders import creodias
+
+    with (
+        patch.object(
+            creodias,
+            "download",
+            side_effect=requests.exceptions.ConnectionError("still down"),
+        ),
+        patch.object(creodias.time, "sleep"),
+    ):
+        with pytest.raises(requests.exceptions.ConnectionError):
+            creodias._download_with_retry(
+                "uid123", token="tok", outfile="/tmp/x.zip", max_retries=3
+            )
+
+
+@pytest.mark.unit
+def test_download_list_skips_persistently_failing_file_and_continues(tmp_path, caplog):
+    """download_list must not let one file's persistent network failure
+    crash the whole batch -- it should log the failure, skip that file,
+    and continue downloading the rest."""
+    import logging
+    import requests
+    from HydroEO.downloaders import creodias
+
+    good_uids = ["good1", "good2"]
+    bad_uid = "bad1"
+    uids = ["good1", "bad1", "good2"]
+
+    def fake_download(uid, token, outfile, show_progress=True):
+        if uid == bad_uid:
+            raise requests.exceptions.ChunkedEncodingError("dropped connection")
+        Path(outfile).write_text("data")
+
+    with (
+        patch.object(creodias, "download", side_effect=fake_download),
+        patch.object(creodias.time, "sleep"),
+        patch.object(creodias, "_get_token", return_value="tok"),
+        caplog.at_level(logging.WARNING),
+    ):
+        result_token, _ = creodias.download_list(
+            uids,
+            username="u",
+            password="p",
+            token="tok",
+            session_start_time=__import__("time").time(),
+            outdir=str(tmp_path),
+            show_progress=False,
+        )
+
+    for uid in good_uids:
+        assert (tmp_path / f"{uid}.zip").exists(), f"{uid} should have downloaded fine"
+    assert not (tmp_path / f"{bad_uid}.zip").exists()
+    assert "Giving up on bad1" in caplog.text
+    assert "1 of 3 file(s) could not be downloaded" in caplog.text
+
 
 
 @pytest.mark.unit

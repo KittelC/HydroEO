@@ -304,6 +304,42 @@ def download(uid, token, outfile, show_progress=True):
     url = f"{DOWNLOAD_URL}/{uid}?token={token}"
     _download_raw_data(url, outfile, show_progress)
 
+# Network exceptions that a retry is actually likely to fix -- a dropped
+# connection mid-transfer, a connection that never got established, or a
+# request that timed out. Deliberately NOT catching things like auth
+# failures or 4xx responses (those don't self-resolve on retry, and
+# _download_raw_data doesn't raise for a non-200 status anyway -- it just
+# logs and returns, so nothing to catch there).
+_TRANSIENT_DOWNLOAD_EXCEPTIONS = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
+
+def _download_with_retry(uid, token, outfile, max_retries=3, backoff_seconds=2):
+    """Retry download() a few times with backoff for transient network
+    failures (dropped connections, timeouts) before giving up on this one
+    file. Raises the last exception if every attempt fails, so the caller
+    can decide whether to skip this file and continue with the rest."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            download(uid, token=token, outfile=outfile, show_progress=False)
+            return
+        except _TRANSIENT_DOWNLOAD_EXCEPTIONS as exc:
+            if attempt == max_retries:
+                raise
+            wait = backoff_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "Download of %s failed (attempt %d/%d): %s -- retrying in %ds",
+                uid,
+                attempt,
+                max_retries,
+                exc,
+                wait,
+            )
+            time.sleep(wait)
+
 
 def download_list(
     uids,
@@ -352,7 +388,7 @@ def download_list(
                 desc=f"Downloading files to {os.path.basename(outdir)}",
                 unit="file",
             )
-
+    failed_uids = []
     for uid in uids:
         # assess age of token, (Expires every ten minutes so we refresh every 9 minutes)
         if _token_age(session_start_time) > 9:
@@ -365,7 +401,21 @@ def download_list(
 
         # download file
         outfile = Path(outdir) / f"{uid}.zip"
-        download(uid, token=token, outfile=outfile, show_progress=False)
+        try:
+            _download_with_retry(uid, token=token, outfile=outfile)
+        except _TRANSIENT_DOWNLOAD_EXCEPTIONS as exc:
+            logger.warning(
+                "Giving up on %s after repeated network failures: %s -- "
+                "skipping and continuing with the rest of the batch. "
+                "Re-run download() afterward to retry just this file "
+                "(already-downloaded files are skipped automatically).",
+                uid,
+                exc,
+            )
+            failed_uids.append(uid)
+            if show_progress:
+                pbar.update(1)
+            continue
 
         if log_file:
             with open(log_file, "a") as log:
@@ -373,5 +423,13 @@ def download_list(
 
         if show_progress:
             pbar.update(1)
+
+    if failed_uids:
+        logger.warning(
+            "%d of %d file(s) could not be downloaded after retries: %s",
+            len(failed_uids),
+            len(uids),
+            ", ".join(failed_uids),
+        )
 
     return token, session_start_time
