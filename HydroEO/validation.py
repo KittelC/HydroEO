@@ -537,6 +537,18 @@ def validate_config(
             issues.append(f"'{mission}.mad_threshold' must be a positive number.")
 
         if mission == "swot":
+            if "pld_match_max_distance_m" in mission_cfg:
+                logger.warning(
+                    "'swot.pld_match_max_distance_m' was renamed to "
+                    "'swot.pld_match_min_overlap_pct' and its meaning "
+                    "changed from a distance in metres to a minimum "
+                    "overlap percentage (0-100) -- your old value (%s) is "
+                    "NOT being reused. Set "
+                    "'pld_match_min_overlap_pct' explicitly if you want "
+                    "something other than the default (10.0).",
+                    mission_cfg["pld_match_max_distance_m"],
+                )
+
             min_overlap_pct = mission_cfg.get("pld_match_min_overlap_pct", 10.0)
             if not isinstance(min_overlap_pct, (int, float)) or not (
                 0 <= min_overlap_pct <= 100

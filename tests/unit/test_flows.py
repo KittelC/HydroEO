@@ -234,6 +234,125 @@ def test_prepare_sword_saves_subset(mock_project_rivers, tmp_path):
 
 
 @pytest.mark.unit
+def test_prepare_sword_handles_aoi_id_key_colliding_with_sword_column(
+    mock_project_rivers, tmp_path, caplog
+):
+    """Regression test: if the AOI file's id_key column happens to be
+    named the same as one of SWORD's own columns (e.g. "reach_id" -- very
+    plausible if a user's AOI was derived from SWORD directly), the
+    resulting subset must not end up with gpd.sjoin's silently-generated
+    "reach_id_left"/"reach_id_right" columns, or a genuine duplicate
+    "reach_id" column. Both SWORD's native value and the AOI's own
+    grouping value must survive, unambiguously, under distinct names, and
+    prj.rivers.id_key must be updated to point at wherever the AOI's value
+    actually ended up."""
+    import logging
+
+    sword_gdf = gpd.GeoDataFrame(
+        {
+            "node_id": [1001, 1002, 1003],
+            "reach_id": [5001, 5002, 5003],  # SWORD's own native reach_id
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)],
+        },
+        crs="EPSG:4326",
+    )
+    sword_dir = tmp_path / "aux" / "SWORD" / "gpkg"
+    sword_dir.mkdir(parents=True, exist_ok=True)
+    sword_gdf.to_file(str(sword_dir / "eu_sword_nodes_v17b.gpkg"), driver="GPKG")
+
+    # AOI file's own id_key is ALSO literally "reach_id" -- e.g. because
+    # the user built their AOI from SWORD reach polygons directly, with
+    # values that don't necessarily match SWORD's own reach_id numbering.
+    aoi_gdf = gpd.GeoDataFrame(
+        {"reach_id": [999], "geometry": [box(0.5, 0.5, 1.5, 1.5)]},
+        crs="EPSG:4326",
+    )
+    mock_project_rivers.rivers.input_mode = "aoi_path"
+    mock_project_rivers.rivers.aoi_gdf = aoi_gdf
+    mock_project_rivers.rivers.continent_key = "eu"
+    mock_project_rivers.rivers.feature_type = "nodes"
+    mock_project_rivers.rivers.buffer_meters = 0
+    mock_project_rivers.rivers.id_key = "reach_id"
+    mock_project_rivers.local_crs = "EPSG:3857"
+
+    with (
+        patch.object(flows._river_init, "_ensure_sword_database"),
+        caplog.at_level(logging.WARNING),
+    ):
+        flows._prepare_rivers_from_sword(mock_project_rivers)
+
+        assert "reach_id" in caplog.text
+        assert "reach_id_aoi" in caplog.text
+
+    subset_path = tmp_path / "aux" / "SWORD" / "SWORD_subset.gpkg"
+    result = gpd.read_file(str(subset_path))
+
+    # No ambiguous _left/_right columns, no genuine duplicate "reach_id"
+    assert "reach_id_left" not in result.columns
+    assert "reach_id_right" not in result.columns
+    assert list(result.columns).count("reach_id") == 1
+
+    # SWORD's own native reach_id survives untouched
+    assert set(result["reach_id"]) == {5002}
+    # the AOI's own grouping value survives under the disambiguated name
+    assert "reach_id_aoi" in result.columns
+    assert set(result["reach_id_aoi"]) == {999}
+    # id_key was updated to point at wherever the AOI's value actually is
+    assert mock_project_rivers.rivers.id_key == "reach_id_aoi"
+
+@pytest.mark.unit
+def test_prepare_sword_uses_aoi_directly_when_aoi_is_sword_extract(
+    mock_project_rivers, caplog
+):
+    """When rivers.aoi_is_sword_extract is enabled, the AOI file's own
+    reach_id/node_id column is trusted directly as SWORD truth -- no
+    download, no intersect, no spatial join at all."""
+    import logging
+
+    aoi_gdf = gpd.GeoDataFrame(
+        {"reach_id": [5001, 5002], "my_group": ["grp1", "grp2"]},
+        geometry=[Point(0, 0), Point(1, 1)],
+        crs="EPSG:4326",
+    )
+    mock_project_rivers.rivers.aoi_gdf = aoi_gdf
+    mock_project_rivers.rivers.feature_type = "reaches"
+    mock_project_rivers.rivers.id_key = "my_group"
+    mock_project_rivers.rivers.aoi_is_sword_extract = True
+
+    with (
+        patch.object(flows._river_init, "_ensure_sword_database") as mock_ensure,
+        caplog.at_level(logging.WARNING),
+    ):
+        flows._prepare_rivers_from_sword(mock_project_rivers)
+
+        mock_ensure.assert_not_called()
+        assert "aoi_is_sword_extract is enabled" in caplog.text
+
+    assert mock_project_rivers.rivers.target_id_col == "reach_id"
+    assert mock_project_rivers.rivers.target_ids == [5001, 5002]
+    assert "my_group" in mock_project_rivers.rivers.target_features.columns
+
+
+@pytest.mark.unit
+def test_prepare_sword_aoi_is_sword_extract_raises_if_id_column_missing(
+    mock_project_rivers,
+):
+    """A clear error (not a confusing downstream KeyError) if
+    aoi_is_sword_extract is enabled but the AOI file doesn't actually have
+    the expected SWORD id column for the configured feature_type."""
+    aoi_gdf = gpd.GeoDataFrame(
+        {"my_group": ["grp1"]}, geometry=[Point(0, 0)], crs="EPSG:4326"
+    )
+    mock_project_rivers.rivers.aoi_gdf = aoi_gdf
+    mock_project_rivers.rivers.feature_type = "reaches"
+    mock_project_rivers.rivers.id_key = "my_group"
+    mock_project_rivers.rivers.aoi_is_sword_extract = True
+
+    with pytest.raises(KeyError, match="aoi_is_sword_extract"):
+        flows._prepare_rivers_from_sword(mock_project_rivers)
+
+
+@pytest.mark.unit
 def test_ensure_sword_skips_when_db_exists(mock_project_rivers, tmp_path):
     """_ensure_sword_database skips download when GPKGs already exist."""
     # Create dummy GPKG file in sword dir
@@ -1048,6 +1167,59 @@ def test_assign_pld_id_warns_but_uses_low_overlap_match(mock_project_reservoirs,
     assert result.loc[1, "prior_lake_id"] == 1001, (
         "the low-overlap match should still be used, not rejected"
     )
+
+
+@pytest.mark.unit
+def test_initialize_reservoirs_uses_aoi_directly_when_aoi_is_pld_extract(
+    mock_project_reservoirs, caplog
+):
+    """When reservoirs.aoi_is_pld_extract is enabled, the reservoirs file's
+    own lake_id/res_id columns are trusted directly as PLD truth -- no
+    download, no spatial overlay matching at all. Also verifies that a
+    non-positive sentinel value from the file's OWN convention (here -1,
+    not this codebase's -9999) is still correctly recognized as
+    unmatched, not mistaken for a genuine match."""
+    import logging
+
+    Path(mock_project_reservoirs.dirs["pld"]).parent.mkdir(parents=True, exist_ok=True)
+    mock_project_reservoirs.reservoirs.gdf["lake_id"] = [1001, -1]
+    mock_project_reservoirs.reservoirs.aoi_is_pld_extract = True
+    mock_project_reservoirs.to_download = ["swot"]
+    mock_project_reservoirs.to_process = ["swot"]
+
+    with (
+        patch.object(flows._reservoir_init, "_download_pld") as mock_download,
+        patch.object(flows._reservoir_init, "_assign_pld_id") as mock_assign,
+        caplog.at_level(logging.WARNING),
+    ):
+        flows.initialize_reservoirs(mock_project_reservoirs)
+
+        mock_download.assert_not_called()
+        mock_assign.assert_not_called()
+        assert "aoi_is_pld_extract is enabled" in caplog.text
+
+    result = mock_project_reservoirs.reservoirs.gdf.set_index("id")
+    assert result.loc[1, "prior_lake_id"] == 1001
+    assert result.loc[1, "pld_match_method"] == "aoi_is_pld_extract"
+    assert result.loc[2, "prior_lake_id"] == -9999
+    assert result.loc[2, "pld_match_method"] == "unmatched"
+
+
+@pytest.mark.unit
+def test_assign_pld_id_from_aoi_extract_raises_if_lake_id_missing(
+    mock_project_reservoirs,
+):
+    """A clear error (not a confusing downstream AttributeError/KeyError)
+    if aoi_is_pld_extract is enabled but the reservoirs file doesn't
+    actually have a lake_id column."""
+    from HydroEO.flows._reservoir_init import _assign_pld_id_from_aoi_extract
+
+    assert "lake_id" not in mock_project_reservoirs.reservoirs.gdf.columns
+
+    with pytest.raises(KeyError, match="aoi_is_pld_extract"):
+        _assign_pld_id_from_aoi_extract(mock_project_reservoirs)
+
+
 
 
 @pytest.mark.unit

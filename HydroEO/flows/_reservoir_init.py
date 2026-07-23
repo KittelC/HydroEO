@@ -35,11 +35,16 @@ def initialize_reservoirs(prj: "Project") -> None:
     if "swot" not in prj.to_download and "swot" not in prj.to_process:
         return
 
-    # Download PLD if needed
-    _download_pld(prj)
-
-    # Match reservoirs to PLD
-    _assign_pld_id(prj)
+    if getattr(prj.reservoirs, "aoi_is_pld_extract", False):
+        # The reservoirs file itself IS a PLD extract -- trust its own
+        # lake_id/res_id columns directly rather than downloading a fresh
+        # PLD and spatially matching against it.
+        _assign_pld_id_from_aoi_extract(prj)
+    else:
+        # Download PLD if needed
+        _download_pld(prj)
+        # Match reservoirs to PLD
+        _assign_pld_id(prj)
 
     # Export flags for missing priors
     _flag_missing_priors(prj)
@@ -177,6 +182,50 @@ def _assign_pld_id(prj: "Project") -> None:
     )
     joined_gdf.loc[joined_gdf.prior_lake_id.isnull(), "prior_lake_id"] = -9999
     joined_gdf.loc[joined_gdf["prior_lake_id"] == -9999, "pld_match_method"] = "unmatched"
+
+    prj.reservoirs.gdf = joined_gdf
+
+
+def _assign_pld_id_from_aoi_extract(prj: "Project") -> None:
+    """Reservoirs file itself already IS a PLD extract, 
+    so its "lake_id"/"res_id" columns are trusted as PLD truth 
+    directly rather than downloading a fresh PLD and spatially 
+    matching against it.
+    """
+    gdf = prj.reservoirs.gdf
+
+    if "lake_id" not in gdf.columns:
+        raise KeyError(
+            "reservoirs.aoi_is_pld_extract is enabled, but the reservoirs "
+            "file unexpectedly has no 'lake_id' column. Check that the file hasn't been "
+            "corrupted, re-exported with different column names, or if "
+            "the 'aoi_is_pld_extract' option should be disabled."
+        )
+
+    logger.warning(
+        "reservoirs.aoi_is_pld_extract is enabled: skipping PLD download "
+        "and spatial matching, trusting this file's own 'lake_id'%s "
+        "column(s) directly as PLD truth. This bypasses the normal "
+        "fresh-download consistency check entirely. If results look "
+        "wrong, check that this file's PLD data hasn't been corrupted.",
+        "/'res_id'" if "res_id" in gdf.columns else "",
+    )
+
+    joined_gdf = gdf.rename(columns={"lake_id": "prior_lake_id", "res_id": "prior_res_id"})
+    if "prior_res_id" not in joined_gdf.columns:
+        joined_gdf["prior_res_id"] = None
+
+    joined_gdf["prior_lake_id"] = pd.to_numeric(
+        joined_gdf["prior_lake_id"], errors="coerce"
+    )
+    joined_gdf["dist_to_pld"] = 0.0
+    joined_gdf["pld_match_method"] = "aoi_is_pld_extract"
+    # Treat any non-positive value (not just null) as unmatched -- the
+    # AOI file's own convention for "no match" might be e.g. -1 or 0
+    # rather than this codebase's own -9999 sentinel or an actual null.
+    unmatched_mask = joined_gdf.prior_lake_id.isnull() | (joined_gdf.prior_lake_id <= 0)
+    joined_gdf.loc[unmatched_mask, "prior_lake_id"] = -9999
+    joined_gdf.loc[unmatched_mask, "pld_match_method"] = "unmatched"
 
     prj.reservoirs.gdf = joined_gdf
 

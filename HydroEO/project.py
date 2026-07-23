@@ -211,7 +211,14 @@ class Project:
             self.reservoirs.overwrite_extraction = self.config["reservoirs"].get(
                 "overwrite_extraction", False
             )
-
+            # If true, prj.reservoirs.gdf itself IS a PLD extract (its own
+            # "lake_id"/"res_id" columns are trusted directly as PLD
+            # truth). Skips both downloading a fresh PLD and the
+            # spatial overlay matching (_assign_pld_id) entirely.
+            self.reservoirs.aoi_is_pld_extract = self.config["reservoirs"].get(
+                "aoi_is_pld_extract", False
+            )
+ 
             # User-configurable overrides for the merge()/Kalman/svr_radial
             # pipeline
             self.merging_options = self.config["reservoirs"].get(
@@ -277,6 +284,13 @@ class Project:
             self.rivers.feature_type = rivers_cfg.get("feature_type")
             self.rivers.buffer_meters = rivers_cfg.get("buffer_meters")
             self.rivers.configured_id = rivers_cfg.get("id")
+            
+            # If true, rivers.aoi_gdf itself IS a SWORD extract. Skip download
+            # and merging
+            self.rivers.aoi_is_sword_extract = rivers_cfg.get(
+                "aoi_is_sword_extract", False
+            )
+
             self.rivers.target_id_col = target_id_col
             self.rivers.target_ids = target_ids
 

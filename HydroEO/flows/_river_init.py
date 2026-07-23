@@ -34,7 +34,7 @@ def initialize_rivers(prj: "Project") -> None:
     if prj.rivers.input_mode == "aoi_path":
         _prepare_rivers_from_sword(prj)
 
-    id_label = "node" if prj.rivers.target_id_col == "node_id" else "reach"
+    id_label = "node" if prj.rivers.id_key == "node_id" else "reach"
     logger.info(
         "Found river %s %s ids",
         len(prj.rivers.target_ids),
@@ -54,9 +54,35 @@ def _prepare_rivers_from_sword(prj: "Project") -> None:
     Otherwise, ensures SWORD database, performs spatial intersection with AOI, saves subset.
     """
     subset_path = prj.dirs.get("sword_subset")
+    source_id_col = "node_id" if prj.rivers.feature_type == "nodes" else "reach_id"
+
+    # Gate 0: the AOI file itself IS a SWORD extract, trust its own
+    # reach_id/node_id column directly rather than downloading SWORD and
+    # spatially intersecting/joining against it.
+    if getattr(prj.rivers, "aoi_is_sword_extract", False):
+        if source_id_col not in prj.rivers.aoi_gdf.columns:
+            raise KeyError(
+                f"rivers.aoi_is_sword_extract is enabled, but the AOI file "
+                f"has no '{source_id_col}' column. If it's genuinely a "
+                f"SWORD extract (feature_type='{prj.rivers.feature_type}') "
+                f"it should have one. Check that the file hasn't been "
+                f"corrupted, re-exported with different column names, or "
+                f"is actually a plain (non-SWORD) AOI file that shouldn't "
+                f"have this option enabled."
+            )
+        logger.warning(
+            "rivers.aoi_is_sword_extract is enabled: skipping SWORD "
+            "download and spatial intersect/join, trusting this file's "
+            "own '%s' column directly as SWORD truth. This bypasses the "
+            "normal fresh-download consistency check entirely. If "
+            "results look wrong, check that this file's SWORD data hasn't "
+            "been corrupted or gone stale relative to the real SWORD.",
+            source_id_col,
+        )
+        subset = prj.rivers.aoi_gdf.copy()
 
     # Gate 1: Check if subset already exists
-    if subset_path and os.path.exists(subset_path):
+    elif subset_path and os.path.exists(subset_path):
         logger.info("SWORD subset located at %s", subset_path)
         subset = gpd.read_file(subset_path)
     else:
@@ -88,6 +114,26 @@ def _prepare_rivers_from_sword(prj: "Project") -> None:
             )
 
         aoi_join = aoi_local[[prj.rivers.id_key, "geometry"]].copy()
+        if prj.rivers.id_key in subset.columns:
+            new_id_key = f"{prj.rivers.id_key}_aoi"
+            while new_id_key in subset.columns:
+                new_id_key = f"{new_id_key}_aoi"
+            logger.warning(
+                "AOI column '%s' has the same name as one of SWORD's own "
+                "columns. Renaming your AOI's grouping column to "
+                "'%s' internally (rivers.id_key updated to match) to keep "
+                "it distinct from SWORD's own value. If you see "
+                "unexpected results here (e.g. wrong feature grouping), "
+                "check that your SWORD or AOI file hasn't been corrupted "
+                "or doesn't have stale/duplicate columns from a prior "
+                "export.",
+                prj.rivers.id_key,
+                new_id_key,
+            )
+            aoi_join = aoi_join.rename(columns={prj.rivers.id_key: new_id_key})
+            prj.rivers.id_key = new_id_key
+
+
         subset = gpd.sjoin(
             subset,
             aoi_join,
@@ -117,7 +163,6 @@ def _prepare_rivers_from_sword(prj: "Project") -> None:
             logger.info("Kept SWORD gpkg folder (keep_raw_sword=True)")
 
     # Extract target IDs from subset
-    source_id_col = "node_id" if prj.rivers.feature_type == "nodes" else "reach_id"
     if source_id_col not in subset.columns:
         raise KeyError(f"Expected SWORD column '{source_id_col}' missing from subset")
 
